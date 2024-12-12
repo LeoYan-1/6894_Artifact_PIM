@@ -26,7 +26,8 @@
 
 #define ADJ_MATRIX 0
 #define ADJ_LIST 1
-#define INPUT_MODE ADJ_LIST
+// #define INPUT_MODE ADJ_LIST
+#define INPUT_MODE ADJ_MATRIX
 
 #define USE_OPT 0
 
@@ -42,6 +43,11 @@ typedef struct Params
   const char *configFile;
   const char *inputFile;
   bool shouldVerify;
+  std::string algorithm;
+  UINT32 tileSize = 10;
+  UINT32 sliceNum = 1;
+  
+
 } Params;
 
 void usage()
@@ -52,6 +58,9 @@ void usage()
           "\n    -c    dramsim config file"
           "\n    -i    input file containing two vectors (default=generates vector with random numbers)"
           "\n    -v    t = verifies PIM output with host output. (default=false)"
+          "\n    -a    Algorithms. Choose from \"BASELINE\", \"SERIAL\", \"TILED\", or \"SLICED\""
+          "\n    -t    tile size (for TILED algorithm only)"
+          "\n    -s    number of slices (for SLICED algorithm only)"
           "\n");
 }
 
@@ -61,9 +70,10 @@ struct Params getInputParams(int argc, char **argv)
   p.configFile = nullptr;
   p.inputFile = "Dataset/v18772_symetric";
   p.shouldVerify = false;
+  p.algorithm = "BASELINE";
 
   int opt;
-  while ((opt = getopt(argc, argv, "h:c:i:v:")) >= 0)
+  while ((opt = getopt(argc, argv, "h:c:i:v:a:t:s:q:")) >= 0)
   {
     switch (opt)
     {
@@ -79,6 +89,22 @@ struct Params getInputParams(int argc, char **argv)
       break;
     case 'v':
       p.shouldVerify = (*optarg == 't') ? true : false;
+      break;
+    case 'a':
+      static const std::unordered_set<std::string> validAlgorithms = {"BASELINE", "SERIAL", "TILED", "SLICED"};
+      if (validAlgorithms.find(std::string(optarg)) == validAlgorithms.end()){
+        fprintf(stderr, "\nInvalid algorithm specified. Choose from \"BASELINE\", \"SERIAL\", \"TILED\", or \"SLICED\".\n");
+      } else {
+        p.algorithm = optarg;
+      };
+      break;
+    case 't':
+      p.tileSize = atoi(optarg);
+      break;
+    case 's':
+      p.sliceNum = atoi(optarg);
+      break;
+    case 'q':
       break;
     default:
       fprintf(stderr, "\nUnrecognized option!\n");
@@ -369,6 +395,453 @@ int run_adjmatrix(const vector<vector<bool>>& adjMatrix, const vector<vector<UIN
     return count / 6;
 }
 
+#include <algorithm>
+#include <queue>
+
+//record the allocated PIM colum for data reuse
+class PIMColListElem{
+public:    
+    int         ColIdx;
+    PimObjId    ObjId;
+
+    PIMColListElem(int colidx, PimObjId objid): ColIdx(colidx), ObjId(objid){}
+    ~PIMColListElem(){}
+};
+
+
+
+int run_adjmatrix_serial(const vector<vector<bool>>& adjMatrix, const vector<vector<UINT32>>& bitAdjMatrix, uint64_t words_per_device) {
+    uint64_t operandsCount = 4; // src1, src2, dst, popCountSrc
+    uint64_t operandMaxNumberOfWords = words_per_device / operandsCount;
+    int count = 0;
+    int V = bitAdjMatrix.size();
+    uint64_t wordsPerMatrixRow = (V + BITS_PER_INT - 1) / BITS_PER_INT; // Number of 32-bit integers needed per row
+    assert(wordsPerMatrixRow <=  operandMaxNumberOfWords && "Number of vertices cannot exceed (words_per_device / 2)");
+    int oneCount = 0;
+    uint64_t words = 0;
+    std::vector<unsigned int> src1;
+    std::vector<unsigned int> src2;
+    int step = V / 10; // Each 10 percent of the total iterations
+    uint16_t iterations = 0;
+
+    std::deque <PIMColListElem> pimColList;
+    //allocate row
+    PimObjId srcObj0 = pimAlloc(PIM_ALLOC_AUTO, wordsPerMatrixRow, PIM_INT32);
+    if (srcObj0 == -1)
+    {
+        std::cout << "src0: pimAlloc" << std::endl;
+        return -2;
+    }
+    
+    PimObjId dstObj = pimAllocAssociated(srcObj0, PIM_INT32);
+    if (dstObj == -1)
+    {
+        std::cout << "dst: pimAllocAssociated" << std::endl;
+        return -1;
+    }
+    if (DEBUG) cout << "dst allocated successfully!" << endl;
+
+    PimObjId popCountSrcObj = pimAllocAssociated(srcObj0, PIM_INT32);
+    if (popCountSrcObj == -1)
+    {
+        std::cout << "popCountSrc: pimAllocAssociated" << std::endl;
+        return -1;
+    }
+    if (DEBUG) cout << "popCountSrc allocated successfully!" << endl;
+
+
+    for (int i = 0; i < V; ++i) {
+        PimStatus status = pimCopyHostToDevice((void *)bitAdjMatrix[i].data(), srcObj0);
+        if (status != PIM_OK)
+        {
+            std::cout << "src1: pimCopyHostToDevice Abort" << std::endl;
+            return -1;
+        }
+        if (DEBUG) cout << "src1 copied successfully!" << endl;
+        for (int k = 0; k < V; ++k) {
+            int j = (i%2)? (V-1-k) : k;
+            if (adjMatrix[i][j]) 
+            { // If there's an edge between i and j
+                ++oneCount;
+                // cout << "\nnow in point [" << i << "][" << j << "]" << std::endl;
+
+
+                auto it = std::find_if(pimColList.begin(), pimColList.end(), [j](const PIMColListElem elem){
+                    return elem.ColIdx == j;
+                });
+                if(it != pimColList.end())
+                {
+                    // std::cout << "reuse column " << j << std::endl;
+                    status = pimAnd(srcObj0, it->ObjId, dstObj);
+                    if (status != PIM_OK)
+                    {
+                        std::cout << "pimAnd Abort" << std::endl;
+                        return -1;
+                    }
+                    if (DEBUG) cout << "pimAnd completed successfully!" << endl;
+
+                    status = pimPopCount(dstObj, popCountSrcObj);
+                    if (status != PIM_OK)
+                    {
+                        std::cout << "pimPopCount Abort" << std::endl;
+                        return -1;
+                    }
+                    if (DEBUG) cout << "pimPopCount completed successfully!" << endl;
+
+                    int64_t sum = 0;
+                    status = pimRedSumInt(popCountSrcObj, &sum);
+                    if (status != PIM_OK)
+                    {
+                        std::cout << "pimRedSumInt Abort" << std::endl;
+                        return -1;
+                    }
+                    if (DEBUG) cout << "pimRedSum completed successfully!" << endl; 
+                    // cout << "counted: " << sum << " triangles" << std::endl;
+                    count += sum;
+                }
+                else
+                {
+                    PimObjId srcObjNew = pimAllocAssociated(srcObj0, PIM_INT32);
+                    if (srcObjNew == -1)
+                    {
+                        std::cout << "srcNew: pimAllocAssociated" << pimColList.size() << std::endl;
+                        return -1;
+                    }
+                    if (DEBUG) cout << "srcNew allocated successfully!" << endl;
+                    if (pimColList.size()>=60){
+                        pimFree(pimColList[0].ObjId);
+                        pimColList.pop_front();
+                    }
+                    PIMColListElem newCol=PIMColListElem(j, srcObjNew);
+                    pimColList.push_back(newCol);//add a new column to PIM
+                    // std::cout << "add colum "<< j << " to list" << std::endl;
+
+                    //copy new column to PIM
+                    // cout << "copying data: " << *(bitAdjMatrix[j].data()) << " to device" << std::endl;
+                    PimStatus status = pimCopyHostToDevice((void *)bitAdjMatrix[j].data(), srcObjNew);
+                    if (status != PIM_OK)
+                    {
+                        std::cout << "srcNew: pimCopyHostToDevice Abort" << std::endl;
+                        return -1;
+                    }
+                    if (DEBUG) cout << "srcNew copied successfully!" << endl;
+
+                    status = pimAnd(srcObj0, srcObjNew, dstObj);
+                    if (status != PIM_OK)
+                    {
+                        std::cout << "pimAnd Abort" << std::endl;
+                        return -1;
+                    }
+                    if (DEBUG) cout << "pimAnd completed successfully!" << endl;
+
+                    status = pimPopCount(dstObj, popCountSrcObj);
+                    if (status != PIM_OK)
+                    {
+                        std::cout << "pimPopCount Abort" << std::endl;
+                        return -1;
+                    }
+                    if (DEBUG) cout << "pimPopCount completed successfully!" << endl;
+
+                    int64_t sum = 0;
+                    status = pimRedSumInt(popCountSrcObj, &sum);
+                    if (status != PIM_OK)
+                    {
+                        std::cout << "pimRedSumInt Abort" << std::endl;
+                        return -1;
+                    }
+                    if (DEBUG) cout << "pimRedSum completed successfully!" << endl; 
+                    // cout << "counted: " << sum << " triangles" << std::endl;
+                    count += sum;                    
+                }
+
+            }
+
+
+        }
+        if (i % step == 0) {
+            std::cout << "Progress: " << (i * 100 / V) << "\% rows completed." << std::endl;
+        }
+    }
+    // Each triangle is counted 6 times (once at each vertex), so divide the count by 6
+    pimFree(srcObj0);
+    for(size_t i=0; i<pimColList.size(); i++){
+        pimFree(pimColList[i].ObjId);
+    }
+    pimFree(dstObj);
+    pimFree(popCountSrcObj);
+    return count / 6;
+
+
+}
+
+int run_adjmatrix_tiled(const vector<vector<bool>>& adjMatrix, const vector<vector<UINT32>>& bitAdjMatrix, uint64_t words_per_device, int tile_size) {
+    uint64_t operandsCount = 4; // src1, src2, dst, popCountSrc
+    uint64_t operandMaxNumberOfWords = words_per_device / operandsCount;
+    int count = 0;
+    int V = bitAdjMatrix.size();
+
+    uint64_t wordsPerMatrixRow = (V + BITS_PER_INT - 1) / BITS_PER_INT; // Number of 32-bit integers needed per row
+    assert(wordsPerMatrixRow <=  operandMaxNumberOfWords && "Number of vertices cannot exceed (words_per_device / 2)");
+    int oneCount = 0;
+    uint64_t words = 0;
+    std::vector<unsigned int> src1;
+    std::vector<unsigned int> src2;
+
+    int tiles = (V + tile_size - 1) / tile_size;
+    int batch_size = 1;
+
+    int step = tile_size / 10; // Each 10 percent of the total iterations
+    uint16_t iterations = 0;
+
+    std::deque <PIMColListElem> pimColList;
+    //allocate row
+
+    if (wordsPerMatrixRow * tiles >= operandMaxNumberOfWords) return 1;
+    PimObjId srcObj0 = pimAlloc(PIM_ALLOC_AUTO, wordsPerMatrixRow * tiles, PIM_INT32);
+    if (srcObj0 == -1)
+    {
+        std::cout << "src0: pimAlloc" << std::endl;
+        return -2;
+    }
+    
+    PimObjId dstObj = pimAllocAssociated(srcObj0, PIM_INT32);
+    if (dstObj == -1)
+    {
+        std::cout << "dst: pimAllocAssociated" << std::endl;
+        return -1;
+    }
+    if (DEBUG) cout << "dst allocated successfully!" << endl;
+
+    PimObjId popCountSrcObj = pimAllocAssociated(srcObj0, PIM_INT32);
+    if (popCountSrcObj == -1)
+    {
+        std::cout << "popCountSrc: pimAllocAssociated" << std::endl;
+        return -1;
+    }
+    if (DEBUG) cout << "popCountSrc allocated successfully!" << endl;
+
+    //allocate column batch buffer
+    vector<PimObjId> srcObj1;
+    for (int k = 0; k < batch_size; ++k){
+        srcObj1.push_back(pimAllocAssociated(srcObj0, PIM_INT32));
+        if (srcObj1.back() == -1)
+        {
+            std::cout << "srcObj1: pimAllocAssociated" << pimColList.size() << std::endl;
+            return -1;
+        }
+        if (DEBUG) cout << "srcObj1 tile" << k << " allocated successfully!" << endl;
+    }
+
+
+    vector<int> colPtr(tiles, 0);
+    vector<int> rowPtr(tiles, 0);
+    vector<bool> dsablMask(tiles, false);
+
+    while (std::any_of(colPtr.begin(), colPtr.end(), [V](int val) {return val < V;}) || 
+            std::any_of(rowPtr.begin(), rowPtr.end(), [tile_size](int val) {return val < tile_size;}))
+    {
+        std::vector<std::vector<UINT32>> nextBatch(tiles, std::vector<UINT32>());
+        for (int t = 0; t < tiles; ++t){
+            int current_row = t*tile_size + rowPtr[t];
+
+            //copy row to device at the beginning
+            if (colPtr[t] == 0){
+                const vector<UINT32>& copy_data = (rowPtr[t] >= tile_size || current_row >= V)? 
+                                                vector<UINT32>(bitAdjMatrix.begin()->size(), 0) : 
+                                                bitAdjMatrix[current_row];
+                uint64_t idx_begin = t * wordsPerMatrixRow;
+                uint64_t idx_end = idx_begin + wordsPerMatrixRow;
+                PimStatus status = pimCopyHostToDevice((void *)copy_data.data(), srcObj0, idx_begin, idx_end);
+                if (status != PIM_OK)
+                {
+                    std::cout << "src0: pimCopyHostToDevice Abort" << std::endl;
+                    return -1;
+                }
+                if (DEBUG) cout << "src0 copied successfully!" << endl;
+            }
+
+
+            //if row overflow, disable calculation
+            if (rowPtr[t] >= tile_size || current_row >= V){
+                rowPtr[t] = tile_size;
+                colPtr[t] = V;
+                dsablMask[t] = true;
+                continue;
+                cout << "end of tile" << endl;
+            }
+
+
+            //for each batch, collect active column index
+            while(nextBatch[t].size() < batch_size) 
+            {
+                if (adjMatrix[current_row][colPtr[t]]){
+                    nextBatch[t].push_back(colPtr[t]);
+                }
+
+                colPtr[t]++;
+                
+                if (colPtr[t] >= V){
+                    colPtr[t] = 0;
+                    rowPtr[t]++;
+                    //fill the rest of the nextBatch list with "invalid" flag
+                    nextBatch[t].insert(nextBatch[t].end(), batch_size-nextBatch[t].size(), V);
+                }
+            }
+        }
+
+
+        //
+        for (int t = 0; t < tiles; ++t){
+            if (!dsablMask[t]){
+                for (int k = 0; k < batch_size; ++k){
+                    const vector<UINT32>& copyCol = (nextBatch[t][k] >= V)? 
+                                                        std::vector<UINT32>(bitAdjMatrix.begin()->size(), 0) : 
+                                                        bitAdjMatrix[nextBatch[t][k]];
+
+                    uint64_t idx_begin = t * wordsPerMatrixRow;
+                    uint64_t idx_end = idx_begin + wordsPerMatrixRow;
+                    PimStatus status = pimCopyHostToDevice((void *)copyCol.data(), srcObj1[k], idx_begin, idx_end);
+                    if (status != PIM_OK)
+                    {
+                        std::cout << "srcObj" << k << ": pimCopyHostToDevice Abort" << std::endl;
+                        return -1;
+                    }
+                    if (DEBUG) cout << "srcObj" << k << " copied successfully!" << endl;
+                }
+            }
+        }
+
+        for (auto& list : nextBatch){
+            list.clear();
+        }
+
+        for (int k = 0; k < batch_size; ++k){
+            PimStatus status = pimAnd(srcObj0, srcObj1[k], dstObj);
+            if (status != PIM_OK)
+            {
+                std::cout << "pimAnd Abort" << std::endl;
+                return -1;
+            }
+            if (DEBUG) cout << "pimAnd completed successfully!" << endl;
+
+            status = pimPopCount(dstObj, popCountSrcObj);
+            if (status != PIM_OK)
+            {
+                std::cout << "pimPopCount Abort" << std::endl;
+                return -1;
+            }
+            if (DEBUG) cout << "pimPopCount completed successfully!" << endl;
+
+            int64_t sum = 0;
+            status = pimRedSumInt(popCountSrcObj, &sum);
+            if (status != PIM_OK)
+            {
+                std::cout << "pimRedSumInt Abort" << std::endl;
+                return -1;
+            }
+            if (DEBUG) cout << "pimRedSum completed successfully!" << endl; 
+            count += sum;
+        } 
+
+    }
+
+
+    // Each triangle is counted 6 times (once at each vertex), so divide the count by 6
+    pimFree(srcObj0);
+    for(auto& obj : srcObj1){
+        pimFree(obj);
+    }
+    pimFree(dstObj);
+    pimFree(popCountSrcObj);
+    return count / 6;
+
+
+}
+
+
+
+int run_adjmatrix_sliced(const vector<vector<bool>>& adjMatrix, const vector<vector<UINT32>>& bitAdjMatrix, uint64_t words_per_device, int slices) {
+    uint64_t operandsCount = 8; // src1, src2, dst, popCountSrc
+    uint64_t operandMaxNumberOfWords = words_per_device / operandsCount;
+    int count = 0;
+    int V = bitAdjMatrix.size();
+    uint64_t wordsPerMatrixRow = (V + BITS_PER_INT - 1) / BITS_PER_INT; // Number of 32-bit integers needed per row
+    assert(wordsPerMatrixRow <=  operandMaxNumberOfWords && "Number of vertices cannot exceed (words_per_device / 2)");
+    
+    uint64_t sliceSize = (wordsPerMatrixRow + slices -1) / slices; // Size of each slice
+    assert(sliceSize > 0 && "sliceSize must be greater than 0");
+
+    uint64_t words = 0;
+    std::vector<unsigned int> src1;
+    std::vector<unsigned int> src2;
+    int step = V / 10; // Each 10 percent of the total iterations
+    uint16_t iterations = 0;
+
+    for (int i = 0; i < V; ++i) {
+        for (int j = 0; j < V; ++j) {
+            if (adjMatrix[i][j]) { 
+                std::vector<unsigned int> rowSlices; 
+                std::vector<unsigned int> colSlices; 
+
+                
+                for (uint64_t slice = 0; slice * sliceSize < wordsPerMatrixRow; ++slice) {
+                    uint64_t start = slice * sliceSize;
+                    uint64_t end = std::min((slice + 1) * sliceSize, wordsPerMatrixRow);
+
+                    
+                    bool rowNonZero = false;
+                    bool colNonZero = false;
+                    for (uint64_t k = start; k < end; ++k) {
+                        if (bitAdjMatrix[i][k] != 0) rowNonZero = true;
+                        if (bitAdjMatrix[j][k] != 0) colNonZero = true;
+                        if (rowNonZero && colNonZero) break; 
+                    }
+
+                    
+                    if (rowNonZero && colNonZero) {
+                        for (uint64_t k = start; k < end; ++k) {
+                            rowSlices.push_back(bitAdjMatrix[i][k]);
+                            colSlices.push_back(bitAdjMatrix[j][k]);
+                        }
+                    }
+                }
+
+               if (!rowSlices.empty() && !colSlices.empty()) {
+                    src1.insert(src1.end(), rowSlices.begin(), rowSlices.end()); 
+                    src2.insert(src2.end(), colSlices.begin(), colSlices.end()); 
+                    words += rowSlices.size(); 
+                }
+            }
+
+            if((words + wordsPerMatrixRow > operandMaxNumberOfWords) || ((i == V - 1) && (j == V - 1) && words > 0)){
+                cout << "-------------itr[" << iterations << "]-------------" << endl;
+                cout << "Number of words that are processed in this iteration: " << words << endl;
+                std::vector<unsigned int> dst(words);
+                std::vector<unsigned int> popCountSrc(words);
+                int sum = vectorAndPopCntRedSum((uint64_t) words, src1, src2, dst, popCountSrc);
+
+                if(sum < 0)
+                    return -1;
+                
+                words = 0;
+                iterations++;
+                src1.clear();
+                src2.clear();
+                dst.clear();
+                count += sum;
+            }
+
+        }
+        if (i % step == 0) {
+            std::cout << "Progress: " << (i * 100 / V) << "\% rows completed." << std::endl;
+        }
+    }
+    // Each triangle is counted 6 times (once at each vertex), so divide the count by 6
+    return count / 6;
+}
+
+
+
 // Function to convert the adjacency list of a node to bitmap format
 void convertToBitMap(const unordered_set<int>& neighbors, int start, vector<uint32_t>& bitMap) {
     for (int neighbor : neighbors) {
@@ -533,7 +1006,21 @@ int main(int argc, char** argv) {
             cout << "-----------convertToBitwiseAdjMatrix-----------" << endl;
             vector<vector<UINT32>> bitAdjMatrix = convertToBitwiseAdjMatrix(adjMatrix);
             cout << "-----------Start running on PIM-----------" << endl;
-            pimTriCount = run_adjmatrix(adjMatrix, bitAdjMatrix, words_per_device);
+            if (params.algorithm == "BASELINE"){
+                pimTriCount = run_adjmatrix(adjMatrix, bitAdjMatrix, words_per_device);
+            }
+            else if (params.algorithm == "SERIAL"){
+                pimTriCount = run_adjmatrix_serial(adjMatrix, bitAdjMatrix, words_per_device);
+            }
+            else if (params.algorithm == "TILED"){
+                pimTriCount = run_adjmatrix_tiled(adjMatrix, bitAdjMatrix, words_per_device, params.tileSize);
+            }
+            else if (params.algorithm == "SLICED"){
+                pimTriCount = run_adjmatrix_sliced(adjMatrix, bitAdjMatrix, words_per_device, params.sliceNum);
+            }
+            else {
+                fprintf(stderr, "\nINVALID ALGORITHM!!");
+            }
             if (params.shouldVerify){
                 //run on cpu
                 cout << "-----------Triangle Count Verification-----------" << endl;
